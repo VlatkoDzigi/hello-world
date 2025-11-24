@@ -1,0 +1,192 @@
+1. What operations do the following functions perform?
+
+* `film_in_stock(film_id, store_id)`
+  Returns the list of `inventory_id` values for a given film and store that are currently available (not rented out). Internally it checks `inventory_in_stock` for each inventory row.
+
+* `film_not_in_stock(film_id, store_id)`
+  Returns the list of `inventory_id` values for a given film and store that are currently NOT available (all copies are rented). It is basically the opposite of `film_in_stock`.
+
+* `inventory_in_stock(inventory_id)`
+  Returns `TRUE` if a specific inventory item is currently in the store and not rented (no open rental with `return_date IS NULL`), otherwise `FALSE`.
+
+* `inventory_held_by_customer(inventory_id)`
+  Returns the `customer_id` who currently holds the specified inventory item (the rental row with `return_date IS NULL`). Returns `NULL` if the item is not currently rented.
+
+* `get_customer_balance(customer_id, effective_date)`
+  Calculates the customer’s balance (how much they owe) up to a specific date, based on rentals, late fees and payments. In the original implementation not all business rules from the comments are fully implemented.
+
+* `rewards_report(min_monthly_purchases, min_dollar_amount_purchased)`
+  Finds customers who qualify for a “rewards” program: in the previous month they made more than `min_monthly_purchases` payments and the total amount exceeds `min_dollar_amount_purchased`. Returns rows from the `customer` table for those customers.
+
+* `last_day(timestamp)`
+  Returns the last day of the month for the given date (for example, input `2005-06-15` returns `2005-06-30`).
+
+---
+
+2. Why does `rewards_report` return 0 rows? Correct and recreate the function.
+
+The `rewards_report` function uses `CURRENT_DATE` to calculate the “previous month”. The data in the `dvdrental` database is from 2005–2006, so when we call the function today it looks for payments in last month of the current real year (for example 2025), where no rows exist. Therefore it always returns 0 rows.
+
+A reusable and rerunnable solution is to add a date parameter that represents the “current” date for the report and to remove dynamic SQL. Example implementation:
+
+```
+CREATE OR REPLACE FUNCTION public.rewards_report(
+    min_monthly_purchases       integer,
+    min_dollar_amount_purchased numeric,
+    p_today                     date DEFAULT CURRENT_DATE
+)
+RETURNS SETOF customer
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_start date;
+    v_end   date;
+    rec     customer%ROWTYPE;
+BEGIN
+    -- Previous month boundaries based on p_today
+    v_start := date_trunc('month', p_today - interval '1 month')::date;
+    v_end   := last_day(v_start);
+
+    -- Temporary table with qualified customers
+    CREATE TEMP TABLE tmpCustomer (
+        customer_id integer PRIMARY KEY
+    ) ON COMMIT DROP;
+
+    INSERT INTO tmpCustomer (customer_id)
+    SELECT p.customer_id
+    FROM payment p
+    WHERE p.payment_date::date BETWEEN v_start AND v_end
+    GROUP BY p.customer_id
+    HAVING COUNT(*) > min_monthly_purchases
+       AND SUM(p.amount) > min_dollar_amount_purchased;
+
+    -- Return full customer rows
+    FOR rec IN
+        SELECT c.*
+        FROM customer c
+        JOIN tmpCustomer t ON t.customer_id = c.customer_id
+    LOOP
+        RETURN NEXT rec;
+    END LOOP;
+
+    RETURN;
+END;
+$$;
+```
+
+Example test (uses a date in 2006, when data exists):
+
+```
+SELECT * FROM rewards_report(5, 30.00, DATE '2006-02-15');
+```
+
+---
+
+3. Function that can potentially be removed and why
+
+A candidate for removal is `inventory_held_by_customer(inventory_id)`.
+
+Reason:
+
+* It is a very simple wrapper around a single query on the `rental` table (select customer with `return_date IS NULL`).
+* In the standard `dvdrental` scripts it is not referenced by other functions, triggers, or views.
+* The same result can easily be obtained with a direct `SELECT` statement, so the function does not add much value and can be removed if we want to reduce unused code.
+
+---
+
+4. Corrected `get_customer_balance` according to the business requirements
+
+Business rules from the comments:
+
+1. Add the rental fee (`rental_rate`) for all rentals.
+2. Charge 1 dollar for each overdue day (days after `rental_duration`), but no more than 2 × `rental_duration` days.
+3. If the film is more than 2 × `rental_duration` days late, also charge the `replacement_cost`.
+4. Subtract all payments made up to `effective_date`.
+
+One possible implementation that follows these rules:
+
+```
+CREATE OR REPLACE FUNCTION public.get_customer_balance(
+    p_customer_id    integer,
+    p_effective_date timestamp without time zone
+)
+RETURNS numeric
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_charges  numeric := 0;
+    v_payments numeric := 0;
+BEGIN
+    -- Total rental charges + late fees + replacement costs
+    SELECT COALESCE(SUM(r_fee + late_fee + repl_fee), 0)
+    INTO v_charges
+    FROM (
+        SELECT
+            f.rental_rate AS r_fee,
+
+            -- overdue days beyond rental_duration, limited to 2 * rental_duration
+            GREATEST(
+                LEAST(
+                    (
+                        (COALESCE(r.return_date, p_effective_date))::date
+                        - r.rental_date::date
+                        - f.rental_duration
+                    ),
+                    f.rental_duration * 2
+                ),
+                0
+            )::numeric AS late_fee,
+
+            -- replacement cost if overdue > 2 * rental_duration
+            CASE
+                WHEN (COALESCE(r.return_date, p_effective_date)::date - r.rental_date::date)
+                     > f.rental_duration * 2
+                THEN f.replacement_cost
+                ELSE 0
+            END AS repl_fee
+        FROM rental r
+        JOIN inventory i ON i.inventory_id = r.inventory_id
+        JOIN film f      ON f.film_id      = i.film_id
+        WHERE r.customer_id = p_customer_id
+          AND r.rental_date <= p_effective_date
+    ) charges;
+
+    -- Total payments up to effective date
+    SELECT COALESCE(SUM(p.amount), 0)
+    INTO v_payments
+    FROM payment p
+    WHERE p.customer_id  = p_customer_id
+      AND p.payment_date <= p_effective_date;
+
+    RETURN v_charges - v_payments;
+END;
+$$;
+```
+
+---
+
+5. How do `group_concat` and `_group_concat` work? Where are they used?
+
+* `_group_concat(text, text)` is a helper (transition) function that concatenates two strings:
+
+  * if one argument is `NULL`, it returns the other;
+  * if both are non-NULL, it returns `arg1 || ', ' || arg2`.
+* `group_concat(text)` is an aggregate function that uses `_group_concat` as its state transition function. While aggregating rows, it repeatedly calls `_group_concat` to build a comma-separated list from multiple values into a single text value.
+
+They are used, for example, in the `actor_info` view to combine multiple categories or film titles for one actor into a single comma-separated string.
+
+---
+
+6. What does `last_updated` do? Where is it used?
+
+* `last_updated()` is a trigger function.
+  On each `UPDATE` it sets `NEW.last_update = CURRENT_TIMESTAMP` and returns `NEW`.
+* It is used as a `BEFORE UPDATE` trigger on tables that have a `last_update` column (such as `customer`, `address`, `film`, `staff`, `store`, etc.), so that the `last_update` field is automatically maintained whenever a row is modified.
+
+---
+
+7. What is `tmpSQL` in `rewards_report`? Can the function be recreated without `EXECUTE` and dynamic SQL? Why?
+
+* In the original `rewards_report` implementation, `tmpSQL` is a `TEXT` variable that stores a dynamically built SQL string. The function then runs that string with `EXECUTE tmpSQL`. It is used to build and execute `INSERT` and `DROP TABLE` statements dynamically.
+* Yes, the function can be recreated without `EXECUTE` and dynamic SQL, because all database object names (schema, table, and column names) are known at compile time. Only data values (dates, thresholds) are variable, and PL/pgSQL allows us to use normal `INSERT ... SELECT` and `SELECT` statements with parameters directly, as shown in the corrected `rewards_report` implementation above. Dynamic SQL is only necessary when object names themselves need to be dynamic.
